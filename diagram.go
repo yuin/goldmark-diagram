@@ -55,9 +55,11 @@ func (f RendererFunc) Render(w util.BufWriter, source []byte, n *ast.CodeBlock, 
 const DefaultMermaidModuleURL = "https://cdn.jsdelivr.net/npm/mermaid@latest/dist/mermaid.esm.min.mjs"
 
 var mermaidModuleURLKey = renderer.NewContextKey()
+var mermaidUMDURLKey = renderer.NewContextKey()
 
 type mermaidClientRendererConfig struct {
 	moduleURL string
+	umdURL    string
 }
 
 // MermaidClientRendererOption is a functional option for [NewMermaidClientRenderer].
@@ -68,6 +70,16 @@ type MermaidClientRendererOption func(*mermaidClientRendererConfig)
 func WithMermaidModuleURL(url string) MermaidClientRendererOption {
 	return func(c *mermaidClientRendererConfig) {
 		c.moduleURL = url
+	}
+}
+
+// WithMermaidUMDURL sets the URL of the MermaidJS UMD module that is
+// loaded via a <script> tag for browsers that do not support ES modules.
+//
+// If this value is set, ModuleURL will be ignored.
+func WithMermaidUMDURL(url string) MermaidClientRendererOption {
+	return func(c *mermaidClientRendererConfig) {
+		c.umdURL = url
 	}
 }
 
@@ -87,6 +99,7 @@ func NewMermaidClientRenderer(opts ...MermaidClientRendererOption) Renderer {
 	}
 	return RendererFunc(func(w util.BufWriter, source []byte, n *ast.CodeBlock, rc renderer.Context) error {
 		rc.Set(mermaidModuleURLKey, cfg.moduleURL)
+		rc.Set(mermaidUMDURLKey, cfg.umdURL)
 		_, _ = w.WriteString(`<pre class="mermaid">`)
 		tw := html.ContextTextWriter(rc)
 		_, _ = n.Value.WriteTo(tw, source)
@@ -287,11 +300,25 @@ func (r *htmlRenderer) decorateDocument(next html.NodeRenderer) html.NodeRendere
 		if entering {
 			return next.Render(w, source, node, entering, rc)
 		}
-		if url, ok := rc.Get(mermaidModuleURLKey).(string); ok {
+
+		url, ok := rc.Get(mermaidUMDURLKey).(string)
+
+		if ok {
 			bw := w.(util.BufWriter)
-			_, _ = bw.WriteString("<script type=\"module\">\nimport mermaid from '")
+			_, _ = bw.WriteString("<script src=\"")
 			_, _ = bw.WriteString(url)
-			_, _ = bw.WriteString("';\n</script>\n")
+			_, _ = bw.WriteString("\"></script>\n")
+			_, _ = bw.WriteString(`
+<script>
+  mermaid.initialize({ startOnLoad: true });
+</script>`)
+		} else {
+			if url, ok := rc.Get(mermaidModuleURLKey).(string); ok {
+				bw := w.(util.BufWriter)
+				_, _ = bw.WriteString("<script type=\"module\">\nimport mermaid from '")
+				_, _ = bw.WriteString(url)
+				_, _ = bw.WriteString("';\n</script>\n")
+			}
 		}
 		return next.Render(w, source, node, entering, rc)
 	})
