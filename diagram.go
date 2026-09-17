@@ -1,17 +1,25 @@
 // Package diagram is an extension for the goldmark(http://github.com/yuin/goldmark).
 //
 // This extension renders fenced code blocks written in diagram description
-// languages (currently MermaidJS and PlantUML) as diagrams instead of plain
-// code blocks.
+// languages (currently MermaidJS, rendered client-side or server-side via
+// mmdc, and PlantUML, rendered server-side via plantuml) as diagrams instead
+// of plain code blocks.
 package diagram
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/yuin/goldmark/v2/ast"
 	"github.com/yuin/goldmark/v2/renderer"
@@ -99,7 +107,9 @@ func NewMermaidClientRenderer(opts ...MermaidClientRendererOption) Renderer {
 	}
 	return RendererFunc(func(w util.BufWriter, source []byte, n *ast.CodeBlock, rc renderer.Context) error {
 		rc.Set(mermaidModuleURLKey, cfg.moduleURL)
-		rc.Set(mermaidUMDURLKey, cfg.umdURL)
+		if cfg.umdURL != "" {
+			rc.Set(mermaidUMDURLKey, cfg.umdURL)
+		}
 		_, _ = w.WriteString(`<pre class="mermaid">`)
 		tw := html.ContextTextWriter(rc)
 		_, _ = n.Value.WriteTo(tw, source)
@@ -109,6 +119,372 @@ func NewMermaidClientRenderer(opts ...MermaidClientRendererOption) Renderer {
 }
 
 // }}} Mermaid client-side rendering
+
+// Mermaid server-side rendering {{{
+
+type mermaidServerRendererConfig struct {
+	command string
+	args    []string
+
+	dual bool
+
+	theme           string
+	backgroundColor string
+
+	lightTheme      string
+	darkTheme       string
+	lightBackground string
+	darkBackground  string
+
+	outputDir string
+	urlPrefix string
+}
+
+// MermaidServerRendererOption is a functional option for [NewMermaidServerRenderer].
+type MermaidServerRendererOption func(*mermaidServerRendererConfig)
+
+// WithMermaidCommand sets the path to the `mmdc` (mermaid-cli) command.
+//
+// If not set, "mmdc" is resolved using the PATH environment variable.
+func WithMermaidCommand(path string) MermaidServerRendererOption {
+	return func(c *mermaidServerRendererConfig) {
+		c.command = path
+	}
+}
+
+// WithMermaidArgs sets additional arguments passed to the `mmdc` command,
+// appended after the arguments generated internally (input/output/format/
+// theme/background).
+func WithMermaidArgs(args ...string) MermaidServerRendererOption {
+	return func(c *mermaidServerRendererConfig) {
+		c.args = args
+	}
+}
+
+// WithMermaidTheme sets the MermaidJS theme used when dual theme rendering
+// is not enabled via [WithMermaidDualTheme].
+//
+// It is ignored if [WithMermaidDualTheme] is used.
+func WithMermaidTheme(theme string) MermaidServerRendererOption {
+	return func(c *mermaidServerRendererConfig) {
+		c.theme = theme
+	}
+}
+
+// WithMermaidBackgroundColor sets the background color used when dual theme
+// rendering is not enabled via [WithMermaidDualTheme].
+//
+// It is ignored if [WithMermaidDualTheme] is used.
+func WithMermaidBackgroundColor(color string) MermaidServerRendererOption {
+	return func(c *mermaidServerRendererConfig) {
+		c.backgroundColor = color
+	}
+}
+
+// WithMermaidDualTheme enables rendering the diagram twice, once with light
+// and once with dark, and embeds both into a single <picture> element so the
+// browser can switch between them based on `prefers-color-scheme`.
+func WithMermaidDualTheme(light, dark string) MermaidServerRendererOption {
+	return func(c *mermaidServerRendererConfig) {
+		c.dual = true
+		c.lightTheme = light
+		c.darkTheme = dark
+	}
+}
+
+// WithMermaidDualBackgroundColor sets the background colors used for the
+// light and dark variants when [WithMermaidDualTheme] is used.
+func WithMermaidDualBackgroundColor(light, dark string) MermaidServerRendererOption {
+	return func(c *mermaidServerRendererConfig) {
+		c.lightBackground = light
+		c.darkBackground = dark
+	}
+}
+
+// WithMermaidOutputDir makes [NewMermaidServerRenderer] write rendered SVGs
+// as files under dir, instead of embedding them inline into the HTML output.
+//
+// Files are named after a hash of the diagram source, theme and background
+// color, so identical diagrams are rendered once and reused.
+func WithMermaidOutputDir(dir string) MermaidServerRendererOption {
+	return func(c *mermaidServerRendererConfig) {
+		c.outputDir = dir
+	}
+}
+
+// WithMermaidURLPrefix sets the URL path prefix used when referencing files
+// written to the directory configured via [WithMermaidOutputDir] (e.g. in
+// `src`/`srcset` attributes).
+//
+// If not set, it defaults to "/" + the base name of the output directory.
+func WithMermaidURLPrefix(prefix string) MermaidServerRendererOption {
+	return func(c *mermaidServerRendererConfig) {
+		c.urlPrefix = prefix
+	}
+}
+
+type mermaidServerRenderer struct {
+	cfg mermaidServerRendererConfig
+
+	dirOnce sync.Once
+	dirErr  error
+}
+
+// NewMermaidServerRenderer returns a [Renderer] that renders MermaidJS
+// diagrams by invoking the `mmdc` (mermaid-cli) command as a subprocess.
+//
+// By default, the rendered SVG is embedded directly into the HTML output. If
+// [WithMermaidOutputDir] is set, the SVG is written as a file under that
+// directory and referenced via an `<img>` element instead. If
+// [WithMermaidDualTheme] is set, the diagram is rendered twice (light and
+// dark) and embedded using a `<picture>` element so the browser can switch
+// between them based on `prefers-color-scheme`.
+//
+// If the command cannot be executed or exits with an error, an error message
+// is rendered in a `<pre class="mermaid-error">` element instead of failing
+// the whole document render.
+func NewMermaidServerRenderer(opts ...MermaidServerRendererOption) Renderer {
+	cfg := mermaidServerRendererConfig{
+		command:         "mmdc",
+		theme:           "default",
+		backgroundColor: "white",
+		lightTheme:      "default",
+		darkTheme:       "dark",
+		lightBackground: "white",
+		darkBackground:  "transparent",
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.outputDir != "" && cfg.urlPrefix == "" {
+		cfg.urlPrefix = defaultMermaidURLPrefix(cfg.outputDir)
+	}
+	return &mermaidServerRenderer{cfg: cfg}
+}
+
+type mermaidVariant struct {
+	label      string // "", "light" or "dark"
+	theme      string
+	background string
+}
+
+type mermaidVariantResult struct {
+	label string
+	svg   []byte // used in inline mode
+	url   string // used in output-dir mode
+	err   error
+}
+
+func (r *mermaidServerRenderer) variants() []mermaidVariant {
+	if r.cfg.dual {
+		return []mermaidVariant{
+			{label: "light", theme: r.cfg.lightTheme, background: r.cfg.lightBackground},
+			{label: "dark", theme: r.cfg.darkTheme, background: r.cfg.darkBackground},
+		}
+	}
+	return []mermaidVariant{
+		{theme: r.cfg.theme, background: r.cfg.backgroundColor},
+	}
+}
+
+// Render implements Renderer.Render.
+func (r *mermaidServerRenderer) Render(w util.BufWriter, source []byte, n *ast.CodeBlock, rc renderer.Context) error {
+	var buf bytes.Buffer
+	_, _ = n.Value.WriteTo(&buf, source)
+	src := buf.Bytes()
+
+	variants := r.variants()
+	results := make([]mermaidVariantResult, len(variants))
+	for i, v := range variants {
+		results[i] = r.renderVariant(v, src)
+	}
+
+	if err := combineMermaidErrors(results); err != nil {
+		_, _ = w.WriteString(`<pre class="mermaid-error">`)
+		tw := html.ContextTextWriter(rc)
+		_, _ = tw.WriteString(err.Error())
+		_, _ = w.WriteString("</pre>\n")
+		return nil
+	}
+
+	r.writeOutput(w, results)
+	return nil
+}
+
+func (r *mermaidServerRenderer) renderVariant(v mermaidVariant, src []byte) mermaidVariantResult {
+	result := mermaidVariantResult{label: v.label}
+	if r.cfg.outputDir == "" {
+		svg, err := runMermaid(r.cfg.command, r.cfg.args, v.theme, v.background, src)
+		result.svg, result.err = svg, err
+		return result
+	}
+	url, err := r.renderToFile(v, src)
+	result.url, result.err = url, err
+	return result
+}
+
+func (r *mermaidServerRenderer) ensureDir() error {
+	r.dirOnce.Do(func() {
+		r.dirErr = os.MkdirAll(r.cfg.outputDir, 0o755)
+	})
+	return r.dirErr
+}
+
+func (r *mermaidServerRenderer) renderToFile(v mermaidVariant, src []byte) (string, error) {
+	if err := r.ensureDir(); err != nil {
+		return "", err
+	}
+
+	filename := mermaidCacheKey(src, v.theme, v.background) + ".svg"
+	if v.label != "" {
+		filename = mermaidCacheKey(src, v.theme, v.background) + "-" + v.label + ".svg"
+	}
+
+	target := filepath.Join(r.cfg.outputDir, filename)
+	if info, err := os.Stat(target); err == nil && info.Size() > 0 {
+		return mermaidFileURL(r.cfg.urlPrefix, filename), nil
+	}
+
+	svg, err := runMermaid(r.cfg.command, r.cfg.args, v.theme, v.background, src)
+	if err != nil {
+		return "", err
+	}
+	if err := writeMermaidFileAtomic(r.cfg.outputDir, filename, svg); err != nil {
+		return "", err
+	}
+	return mermaidFileURL(r.cfg.urlPrefix, filename), nil
+}
+
+func (r *mermaidServerRenderer) writeOutput(w util.BufWriter, results []mermaidVariantResult) {
+	if !r.cfg.dual {
+		res := results[0]
+		if r.cfg.outputDir == "" {
+			_, _ = w.Write(res.svg)
+			return
+		}
+		_, _ = w.WriteString(`<img src="`)
+		_, _ = w.WriteString(res.url)
+		_, _ = w.WriteString("\">\n")
+		return
+	}
+
+	light, dark := mermaidResultByLabel(results, "light"), mermaidResultByLabel(results, "dark")
+	lightSrc, darkSrc := light.url, dark.url
+	if r.cfg.outputDir == "" {
+		lightSrc = mermaidDataURI(light.svg)
+		darkSrc = mermaidDataURI(dark.svg)
+	}
+
+	_, _ = w.WriteString("<picture>\n")
+	_, _ = w.WriteString(`<source srcset="`)
+	_, _ = w.WriteString(darkSrc)
+	_, _ = w.WriteString(`" media="(prefers-color-scheme: dark)">` + "\n")
+	_, _ = w.WriteString(`<img src="`)
+	_, _ = w.WriteString(lightSrc)
+	_, _ = w.WriteString("\">\n")
+	_, _ = w.WriteString("</picture>\n")
+}
+
+func mermaidResultByLabel(results []mermaidVariantResult, label string) mermaidVariantResult {
+	for _, res := range results {
+		if res.label == label {
+			return res
+		}
+	}
+	return mermaidVariantResult{}
+}
+
+func mermaidDataURI(svg []byte) string {
+	return "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString(svg)
+}
+
+func combineMermaidErrors(results []mermaidVariantResult) error {
+	var msgs []string
+	for _, res := range results {
+		if res.err == nil {
+			continue
+		}
+		if res.label == "" {
+			msgs = append(msgs, res.err.Error())
+			continue
+		}
+		msgs = append(msgs, fmt.Sprintf("%s: %s", res.label, res.err.Error()))
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s", strings.Join(msgs, "; "))
+}
+
+func mermaidCacheKey(source []byte, theme, backgroundColor string) string {
+	h := sha256.New()
+	h.Write(source)
+	h.Write([]byte{0})
+	h.Write([]byte(theme))
+	h.Write([]byte{0})
+	h.Write([]byte(backgroundColor))
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+func writeMermaidFileAtomic(dir, filename string, data []byte) error {
+	tmp, err := os.CreateTemp(dir, filename+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	_, writeErr := tmp.Write(data)
+	closeErr := tmp.Close()
+	if writeErr != nil || closeErr != nil {
+		_ = os.Remove(tmpPath)
+		if writeErr != nil {
+			return writeErr
+		}
+		return closeErr
+	}
+	if err := os.Rename(tmpPath, filepath.Join(dir, filename)); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+func mermaidFileURL(prefix, filename string) string {
+	return path.Join(prefix, filename)
+}
+
+func defaultMermaidURLPrefix(outputDir string) string {
+	base := filepath.Base(filepath.Clean(outputDir))
+	if base == "." || base == "" || base == string(filepath.Separator) {
+		return "/"
+	}
+	return "/" + base
+}
+
+func runMermaid(command string, extraArgs []string, theme, backgroundColor string, src []byte) ([]byte, error) {
+	args := append([]string{"-i", "-", "-o", "-", "-e", "svg", "-t", theme, "-b", backgroundColor}, extraArgs...)
+	cmd := exec.Command(command, args...) // nolint:gosec
+	cmd.Stdin = bytes.NewReader(src)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if msg := firstMermaidErrorMessage(stderr.String()); msg != "" {
+			return nil, fmt.Errorf("mmdc: %s", msg)
+		}
+		return nil, fmt.Errorf("mmdc: %w", err)
+	}
+	return stdout.Bytes(), nil
+}
+
+func firstMermaidErrorMessage(stderr string) string {
+	msg := strings.TrimSpace(stderr)
+	if idx := strings.Index(msg, "\n\n"); idx >= 0 {
+		msg = msg[:idx]
+	}
+	return strings.TrimSpace(msg)
+}
+
+// }}} Mermaid server-side rendering
 
 // PlantUML server-side rendering {{{
 

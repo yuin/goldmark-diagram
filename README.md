@@ -19,6 +19,7 @@ Currently, goldmark-diagram supports diagrams in the following formats:
 
 - [MermaidJS](https://mermaid.js.org/)
   - client-side rendering
+  - server-side rendering (requires an `mmdc` command in `PATH`, or configured via `WithMermaidCommand`)
 - [PlantUML](https://plantuml.com/)
   - server-side rendering (requires a `plantuml` command in `PATH`, or configured via `WithPlantUMLCommand`)
 
@@ -81,6 +82,32 @@ the diagram source on stdin and reading back an SVG on stdout, which is embedded
 the HTML output. If the command is missing or fails, an error message is rendered inside a
 `<pre class="plantuml-error">` element instead of failing the whole render.
 
+MermaidJS can also be rendered server-side with `diagram.NewMermaidServerRenderer()`, which
+invokes the `mmdc` (mermaid-cli) command the same way. By default the resulting SVG is embedded
+directly into the HTML output. If `WithMermaidOutputDir` is set, the SVG is written as a file
+under that directory instead (named after a hash of the source, theme and background color, so
+identical diagrams are only rendered once) and referenced via an `<img>` element. If
+`WithMermaidDualTheme` is set, the diagram is rendered twice (light and dark) and embedded using a
+`<picture>` element so the browser switches between them based on `prefers-color-scheme`:
+
+```go
+diagram.WithRenderer(diagram.LanguageMermaid, diagram.NewMermaidServerRenderer(
+    diagram.WithMermaidDualTheme("default", "dark"),
+    diagram.WithMermaidOutputDir("./public/diagrams"),
+))
+```
+
+```html
+<picture>
+<source srcset="/diagrams/xxxxxxxxxxxxxxxx-dark.svg" media="(prefers-color-scheme: dark)">
+<img src="/diagrams/xxxxxxxxxxxxxxxx-light.svg">
+</picture>
+```
+
+Without `WithMermaidOutputDir`, dual theme rendering embeds both SVGs inline as base64 data URIs
+instead of file paths. If the command is missing or fails, an error message is rendered inside a
+`<pre class="mermaid-error">` element instead of failing the whole render.
+
 ## Options
 
 **HTML Renderer options**
@@ -96,11 +123,25 @@ string of a fenced code block). The languages supported out of the box are expor
 `diagram.LanguageMermaid` (`"mermaid"`) and `diagram.LanguagePlantUML` (`"plantuml"`). You can pass
 any other string value to support additional languages via `WithRenderer` (see [Extending](#extending)).
 
-**Mermaid renderer options** (passed to `diagram.NewMermaidClientRenderer`)
+**Mermaid client renderer options** (passed to `diagram.NewMermaidClientRenderer`)
 
 | Option | Description | Default |
 | --------|-------------| ---------|
 | `diagram.WithMermaidModuleURL(url string)` | Sets the URL of the MermaidJS ESM module | jsDelivr CDN, latest version |
+| `diagram.WithMermaidUMDURL(url string)` | Sets the URL of the MermaidJS UMD module. If this value is set, `WithMermaidModuleURL` will be ignored | "" |
+
+**Mermaid server renderer options** (passed to `diagram.NewMermaidServerRenderer`)
+
+| Option | Description | Default |
+| --------|-------------| ---------|
+| `diagram.WithMermaidCommand(path string)` | Sets the path to the `mmdc` command | `"mmdc"` (resolved via `PATH`) |
+| `diagram.WithMermaidArgs(args ...string)` | Sets additional arguments passed to the `mmdc` command | `nil` |
+| `diagram.WithMermaidTheme(theme string)` | Sets the theme used when dual theme rendering is not enabled | `"default"` |
+| `diagram.WithMermaidBackgroundColor(color string)` | Sets the background color used when dual theme rendering is not enabled | `"white"` |
+| `diagram.WithMermaidDualTheme(light, dark string)` | Enables rendering the diagram for both light and dark themes, embedded via `<picture>` | disabled |
+| `diagram.WithMermaidDualBackgroundColor(light, dark string)` | Sets the background colors used for the light/dark variants | `"white"` / `"transparent"` |
+| `diagram.WithMermaidOutputDir(dir string)` | Writes rendered SVGs as files under `dir` instead of embedding them inline | `""` (inline) |
+| `diagram.WithMermaidURLPrefix(prefix string)` | Sets the URL path prefix used to reference files written to `WithMermaidOutputDir` | `"/" + base name of the output directory` |
 
 **PlantUML renderer options** (passed to `diagram.NewPlantUMLRenderer`)
 
@@ -112,14 +153,14 @@ any other string value to support additional languages via `WithRenderer` (see [
 ## Extending
 
 goldmark-diagram renders a fenced code block as a diagram by looking up a [`diagram.Renderer`]
-registered for its language. `diagram.NewMermaidClientRenderer()` and `diagram.NewPlantUMLRenderer()`
+registered for its language. `diagram.NewMermaidClientRenderer()`, `diagram.NewMermaidServerRenderer` and `diagram.NewPlantUMLRenderer()`
 are the built-in implementations for `mermaid` and `plantuml`, but you can register your own
 `diagram.Renderer` for any language with `diagram.WithRenderer`, or replace a built-in one — for
-example to switch MermaidJS rendering from client-side to a future server-side implementation:
+example to switch MermaidJS rendering from client-side to server-side:
 
 ```go
 r := html.New(html.WithExtensions(diagram.NewHTMLRenderer(
-    diagram.WithRenderer(diagram.LanguageMermaid, myServerSideMermaidRenderer),
+    diagram.WithRenderer(diagram.LanguageMermaid, diagram.NewMermaidServerRenderer()),
     diagram.WithRenderer("d2", myD2Renderer), // "d2" is not a diagram.Language constant, but any string value works
 )))
 ```

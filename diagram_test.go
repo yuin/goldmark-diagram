@@ -2,7 +2,9 @@ package diagram_test
 
 import (
 	"bytes"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -132,6 +134,148 @@ func TestPlantUMLRendering(t *testing.T) {
 
 	if !strings.Contains(result, "<svg") {
 		t.Fatalf("expected svg output, got:\n%s", result)
+	}
+}
+
+func TestMermaidServerRenderingInline(t *testing.T) {
+	if _, err := exec.LookPath("mmdc"); err != nil {
+		t.Skip("mmdc command is not available")
+	}
+	r := html.New(html.WithExtensions(diagram.NewHTMLRenderer(
+		diagram.WithRenderer(diagram.LanguageMermaid, diagram.NewMermaidServerRenderer()),
+	)))
+	result := convert(t, r, "```mermaid\ngraph LR\n    A --- B\n```\n")
+
+	if !strings.Contains(result, "<svg") {
+		t.Fatalf("expected svg output, got:\n%s", result)
+	}
+	if strings.Contains(result, `<pre class="mermaid">`) || strings.Contains(result, `<script type="module">`) {
+		t.Fatalf("expected no client-side rendering markup, got:\n%s", result)
+	}
+}
+
+func TestMermaidServerRenderingCommandNotFound(t *testing.T) {
+	r := html.New(html.WithExtensions(diagram.NewHTMLRenderer(
+		diagram.WithRenderer(diagram.LanguageMermaid, diagram.NewMermaidServerRenderer(
+			diagram.WithMermaidCommand("goldmark-diagram-nonexistent-command"),
+		)),
+	)))
+	result := convert(t, r, "```mermaid\ngraph LR\n    A --> B\n```\n")
+
+	if !strings.Contains(result, `<pre class="mermaid-error">`) {
+		t.Fatalf("expected mermaid error block, got:\n%s", result)
+	}
+}
+
+func TestMermaidServerRenderingDualThemeInline(t *testing.T) {
+	if _, err := exec.LookPath("mmdc"); err != nil {
+		t.Skip("mmdc command is not available")
+	}
+	r := html.New(html.WithExtensions(diagram.NewHTMLRenderer(
+		diagram.WithRenderer(diagram.LanguageMermaid, diagram.NewMermaidServerRenderer(
+			diagram.WithMermaidDualTheme("default", "dark"),
+		)),
+	)))
+	result := convert(t, r, "```mermaid\ngraph LR\n    A --> B\n```\n")
+
+	if !strings.Contains(result, "<picture>") {
+		t.Fatalf("expected picture element, got:\n%s", result)
+	}
+	if !strings.Contains(result, `media="(prefers-color-scheme: dark)"`) {
+		t.Fatalf("expected dark media query, got:\n%s", result)
+	}
+	if n := strings.Count(result, "data:image/svg+xml;base64,"); n != 2 {
+		t.Fatalf("expected 2 inline data URIs, got %d in:\n%s", n, result)
+	}
+}
+
+func TestMermaidServerRenderingOutputDir(t *testing.T) {
+	if _, err := exec.LookPath("mmdc"); err != nil {
+		t.Skip("mmdc command is not available")
+	}
+	dir := t.TempDir()
+	r := html.New(html.WithExtensions(diagram.NewHTMLRenderer(
+		diagram.WithRenderer(diagram.LanguageMermaid, diagram.NewMermaidServerRenderer(
+			diagram.WithMermaidOutputDir(dir),
+		)),
+	)))
+	source := "```mermaid\ngraph LR\n    A --> B\n```\n"
+	result := convert(t, r, source)
+
+	if !strings.Contains(result, `<img src="/`+filepath.Base(dir)+`/`) {
+		t.Fatalf("expected img tag referencing output dir, got:\n%s", result)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly 1 file in output dir, got %d", len(entries))
+	}
+	info, err := os.Stat(filepath.Join(dir, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	modTime := info.ModTime()
+
+	_ = convert(t, r, source)
+
+	entriesAfter, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entriesAfter) != 1 {
+		t.Fatalf("expected cache hit to avoid creating a new file, got %d files", len(entriesAfter))
+	}
+	infoAfter, err := os.Stat(filepath.Join(dir, entriesAfter[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !infoAfter.ModTime().Equal(modTime) {
+		t.Fatalf("expected cache hit to avoid rewriting the file")
+	}
+}
+
+func TestMermaidServerRenderingURLPrefixDefault(t *testing.T) {
+	if _, err := exec.LookPath("mmdc"); err != nil {
+		t.Skip("mmdc command is not available")
+	}
+	dir := t.TempDir()
+	r := html.New(html.WithExtensions(diagram.NewHTMLRenderer(
+		diagram.WithRenderer(diagram.LanguageMermaid, diagram.NewMermaidServerRenderer(
+			diagram.WithMermaidOutputDir(dir),
+		)),
+	)))
+	result := convert(t, r, "```mermaid\ngraph LR\n    A --> B\n```\n")
+
+	want := `<img src="/` + filepath.Base(dir) + `/`
+	if !strings.Contains(result, want) {
+		t.Fatalf("expected default url prefix derived from output dir basename, got:\n%s", result)
+	}
+}
+
+func TestMermaidServerRenderingDualOutputDir(t *testing.T) {
+	if _, err := exec.LookPath("mmdc"); err != nil {
+		t.Skip("mmdc command is not available")
+	}
+	dir := t.TempDir()
+	r := html.New(html.WithExtensions(diagram.NewHTMLRenderer(
+		diagram.WithRenderer(diagram.LanguageMermaid, diagram.NewMermaidServerRenderer(
+			diagram.WithMermaidDualTheme("default", "dark"),
+			diagram.WithMermaidOutputDir(dir),
+		)),
+	)))
+	result := convert(t, r, "```mermaid\ngraph LR\n    A --> B\n```\n")
+
+	if !strings.Contains(result, "-light.svg") || !strings.Contains(result, "-dark.svg") {
+		t.Fatalf("expected light/dark file references, got:\n%s", result)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected exactly 2 files in output dir, got %d", len(entries))
 	}
 }
 
