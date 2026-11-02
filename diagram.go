@@ -632,6 +632,8 @@ func NewHTMLRenderer(opts ...HTMLRendererOption) html.Extension {
 }
 
 // HTMLRenderer is a default [html.Extension] for diagrams.
+//
+// Deprecated: Use [NewHTMLRenderer] instead.
 var HTMLRenderer = NewHTMLRenderer()
 
 func (r *htmlRenderer) RendererOptions(_ *html.Config) []html.Option {

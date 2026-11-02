@@ -28,7 +28,7 @@ func convert(t *testing.T, r html.Renderer, source string) string {
 }
 
 func TestMermaidClientRendering(t *testing.T) {
-	r := html.New(html.WithExtensions(diagram.HTMLRenderer))
+	r := html.New(html.WithExtensions(diagram.NewHTMLRenderer()))
 	result := convert(t, r, "```mermaid\ngraph LR\n    A --- B\n```\n")
 
 	if !strings.Contains(result, `<pre class="mermaid">graph LR`) {
@@ -43,7 +43,7 @@ func TestMermaidClientRendering(t *testing.T) {
 }
 
 func TestMermaidClientRenderingEscapesSource(t *testing.T) {
-	r := html.New(html.WithExtensions(diagram.HTMLRenderer))
+	r := html.New(html.WithExtensions(diagram.NewHTMLRenderer()))
 	result := convert(t, r, "```mermaid\nA --\"x\"--> B\n```\n")
 
 	if !strings.Contains(result, "&quot;x&quot;") {
@@ -52,7 +52,7 @@ func TestMermaidClientRenderingEscapesSource(t *testing.T) {
 }
 
 func TestMermaidScriptTagEmittedOnce(t *testing.T) {
-	r := html.New(html.WithExtensions(diagram.HTMLRenderer))
+	r := html.New(html.WithExtensions(diagram.NewHTMLRenderer()))
 	result := convert(t, r, "```mermaid\ngraph LR\n    A --> B\n```\n\n```mermaid\ngraph LR\n    C --> D\n```\n")
 
 	if n := strings.Count(result, "<script type=\"module\">"); n != 1 {
@@ -74,7 +74,7 @@ func TestMermaidCustomModuleURL(t *testing.T) {
 }
 
 func TestNonDiagramCodeBlockIsUnaffected(t *testing.T) {
-	r := html.New(html.WithExtensions(diagram.HTMLRenderer))
+	r := html.New(html.WithExtensions(diagram.NewHTMLRenderer()))
 	result := convert(t, r, "```go\nfunc main() {}\n```\n")
 
 	expected := "<pre><code class=\"language-go\">func main() {}\n</code></pre>\n"
@@ -129,7 +129,7 @@ func TestPlantUMLRendering(t *testing.T) {
 	if _, err := exec.LookPath("plantuml"); err != nil {
 		t.Skip("plantuml command is not available")
 	}
-	r := html.New(html.WithExtensions(diagram.HTMLRenderer))
+	r := html.New(html.WithExtensions(diagram.NewHTMLRenderer()))
 	result := convert(t, r, "```plantuml\n@startuml\nHello <|-- World\n@enduml\n```\n")
 
 	if !strings.Contains(result, "<svg") {

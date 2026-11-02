@@ -59,7 +59,7 @@ import (
 
 func main() {
     p := parser.New()
-    r := html.New(html.WithExtensions(diagram.HTMLRenderer))
+    r := html.New(html.WithExtensions(diagram.NewHTMLRenderer()))
     // r := html.New(html.WithExtensions(diagram.NewHTMLRenderer(
     //     diagram.WithMermaidModuleURL... via a custom mermaid renderer, see below
     // )))
